@@ -1,6 +1,7 @@
 """tests for the http tts engine across local and hosted backends."""
 
 import argparse
+import base64
 import http.client
 import io
 import json
@@ -15,7 +16,9 @@ import pytest
 import soundfile as sf  # type: ignore
 
 from autiobook.config import (
+    GEMINI_API_BASE,
     SAMPLE_RATE,
+    TTS_DIALECT_GEMINI,
     TTS_DIALECT_OPENAI,
     TTS_DIALECT_QWEN,
     TTS_DIRECTION_PREFIX,
@@ -750,3 +753,417 @@ class TestPresetAuditionConfig:
         config = preset_audition_config(object(), LOCAL_BASE)
         assert isinstance(config, HTTPTTSConfig)
         assert config.api_base == LOCAL_BASE
+
+
+GEMINI_MODEL = "gemini-3.8-flash-tts"
+
+
+def _gemini_engine(**kwargs) -> HTTPTTSEngine:
+    defaults = dict(
+        api_base=GEMINI_API_BASE,
+        api_key="g-test",
+        model=GEMINI_MODEL,
+        speaker="Kore",
+    )
+    return HTTPTTSEngine(HTTPTTSConfig(**{**defaults, **kwargs}))
+
+
+def _interaction(audio: bytes) -> bytes:
+    """an interactions api reply carrying one take, as the api frames it."""
+    return json.dumps(
+        {
+            "id": "v1_test",
+            "status": "completed",
+            "steps": [
+                {
+                    "type": "model_output",
+                    "content": [
+                        {"type": "audio", "data": base64.b64encode(audio).decode()}
+                    ],
+                }
+            ],
+        }
+    ).encode()
+
+
+def _gemini_events(*chunks: bytes) -> bytes:
+    """an interactions sse stream: audio deltas framed by step and turn events."""
+    events = [
+        ("interaction.created", {"interaction": {"status": "in_progress"}}),
+        ("step.start", {"index": 0, "step": {"type": "model_output"}}),
+        *(
+            (
+                "step.delta",
+                {
+                    "index": 0,
+                    "delta": {"type": "audio", "data": base64.b64encode(c).decode()},
+                },
+            )
+            for c in chunks
+        ),
+        ("step.stop", {"index": 0}),
+        ("interaction.completed", {"interaction": {"status": "completed"}}),
+    ]
+    return "".join(
+        f"event: {name}\ndata: {json.dumps({**data, 'event_type': name})}\n\n"
+        for name, data in events
+    ).encode()
+
+
+class TestGeminiDialect:
+    """google's interactions api: style metadata, key header, json audio."""
+
+    def test_google_host_resolves_gemini(self):
+        assert _gemini_engine().dialect == TTS_DIALECT_GEMINI
+
+    def test_defaults_to_raw_pcm(self):
+        assert _gemini_engine().response_format == TTS_FORMAT_PCM
+
+    def test_body_shape(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_pcm_bytes())),
+        ) as mock_url:
+            engine.synthesize(
+                "Hello there.", instruct="whispers softly", speaker="Puck"
+            )
+
+        (body,) = _bodies(mock_url)
+        assert body == {
+            "model": GEMINI_MODEL,
+            "input": [
+                {
+                    "type": "user_input",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": "Hello there.",
+                            "annotations": [
+                                {"type": "speech_metadata", "style": "whispers softly"}
+                            ],
+                        }
+                    ],
+                }
+            ],
+            "response_format": {
+                "type": "audio",
+                "mime_type": "audio/l16",
+                "sample_rate": SAMPLE_RATE,
+            },
+            "generation_config": {"speech_config": [{"voice": "Puck"}]},
+            "store": False,
+        }
+
+    def test_no_direction_sends_no_style(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_pcm_bytes())),
+        ) as mock_url:
+            engine.synthesize("Hello there.")
+
+        (content,) = _bodies(mock_url)[0]["input"][0]["content"]
+        assert "annotations" not in content
+        assert _bodies(mock_url)[0]["generation_config"]["speech_config"] == [
+            {"voice": "Kore"}
+        ]
+
+    def test_prefix_direction_never_reaches_the_transcript(self):
+        """3.8 speaks its input verbatim, so a prefixed direction would be read."""
+        engine = _gemini_engine(direction=TTS_DIRECTION_PREFIX)
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_pcm_bytes())),
+        ) as mock_url:
+            engine.synthesize("Hello there.", instruct="whispers softly")
+
+        (content,) = _bodies(mock_url)[0]["input"][0]["content"]
+        assert content["text"] == "Hello there."
+        assert content["annotations"][0]["style"] == "whispers softly"
+
+    def test_key_header_not_bearer(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_pcm_bytes())),
+        ) as mock_url:
+            engine.synthesize("hello")
+
+        req = mock_url.call_args[0][0]
+        assert req.full_url == f"{GEMINI_API_BASE}/interactions"
+        assert req.get_header("X-goog-api-key") == "g-test"
+        assert req.get_header("Authorization") is None
+
+    def test_pcm_reply_decoded(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_pcm_bytes(6))),
+        ):
+            audio, sr = engine.synthesize("hello")
+
+        assert sr == SAMPLE_RATE
+        np.testing.assert_allclose(audio, np.arange(6) / 32768.0)
+
+    def test_wav_reply_decoded(self):
+        engine = _gemini_engine(response_format=TTS_FORMAT_WAV)
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(_interaction(_wav_bytes(0.01))),
+        ) as mock_url:
+            audio, _ = engine.synthesize("hello")
+
+        assert _bodies(mock_url)[0]["response_format"]["mime_type"] == "audio/wav"
+        assert len(audio) == int(SAMPLE_RATE * 0.01)
+
+    def test_last_audio_block_is_the_take(self):
+        reply = json.loads(_interaction(_pcm_bytes(2)))
+        reply["steps"].insert(0, {"type": "thought", "signature": "x"})
+        reply["steps"].append(
+            {
+                "type": "model_output",
+                "content": [
+                    {"type": "audio", "data": base64.b64encode(_pcm_bytes(5)).decode()}
+                ],
+            }
+        )
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(json.dumps(reply).encode()),
+        ):
+            audio, _ = engine.synthesize("hello")
+        assert len(audio) == 5
+
+    def test_reply_without_audio_fails(self):
+        engine = _gemini_engine()
+        payload = json.dumps({"status": "failed", "steps": []}).encode()
+        with patch("urllib.request.urlopen", return_value=_mock_response(payload)):
+            with pytest.raises(RuntimeError, match="no audio.*failed"):
+                engine.synthesize("hello")
+
+    def test_mp3_is_refused_before_sending(self):
+        engine = _gemini_engine(response_format=TTS_FORMAT_MP3)
+        with patch("urllib.request.urlopen") as mock_url:
+            with pytest.raises(RuntimeError, match="mp3"):
+                engine.synthesize("hello")
+        assert mock_url.call_count == 0
+
+    def test_stream_ignores_an_unservable_synthesis_format(self):
+        """streams always ask for pcm, so mp3 for synthesis must not block them."""
+        engine = _gemini_engine(response_format=TTS_FORMAT_MP3)
+        events = _gemini_events(_pcm_bytes(2))
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(events)
+        ) as mock_url:
+            audio, _ = engine.design_voice_stream("hello", "calm")
+        assert len(audio) == 2
+        assert _bodies(mock_url)[0]["response_format"]["mime_type"] == "audio/l16"
+
+    def test_hosted_capabilities(self):
+        engine = _gemini_engine()
+        assert engine.seeded is False
+        assert engine.streaming is True
+
+    def test_known_voices_without_request(self):
+        with patch("urllib.request.urlopen") as mock_url:
+            voices = _gemini_engine().list_voices()
+        assert "Kore" in voices and len(voices) == 30
+        assert mock_url.call_count == 0
+
+    def test_design_and_clone_point_at_preset_voices(self):
+        engine = _gemini_engine()
+        with pytest.raises(RuntimeError, match="--preset-voices"):
+            engine.design_voice("hello", "a gruff old sailor")
+        with pytest.raises(RuntimeError, match="--preset-voices"):
+            engine.clone_voice("hello", np.zeros(10, dtype="float32"), "ref")
+
+    def test_stream_parses_audio_deltas(self):
+        engine = _gemini_engine(response_format=TTS_FORMAT_WAV)
+        chunks: list[bytes] = []
+        events = _gemini_events(_pcm_bytes(3), _pcm_bytes(4))
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(events)
+        ) as mock_url:
+            audio, sr = engine.design_voice_stream(
+                "hello", "calm", on_chunk=chunks.append, voice="Puck"
+            )
+
+        assert chunks == [_pcm_bytes(3), _pcm_bytes(4)]
+        assert len(audio) == 7 and sr == SAMPLE_RATE
+        req = mock_url.call_args[0][0]
+        assert req.full_url == f"{GEMINI_API_BASE}/interactions?alt=sse"
+        assert req.get_header("Accept") == "text/event-stream"
+        body = _bodies(mock_url)[0]
+        assert body["stream"] is True
+        # the player takes raw samples whatever format synthesis is set to
+        assert body["response_format"]["mime_type"] == "audio/l16"
+        assert body["generation_config"]["speech_config"] == [{"voice": "Puck"}]
+
+    def test_stream_error_event_fails(self):
+        engine = _gemini_engine()
+        events = b'event: error\ndata: {"error": {"code": 400}}\n\n'
+        with patch("urllib.request.urlopen", return_value=_mock_response(events)):
+            with pytest.raises(RuntimeError, match="tts stream error"):
+                engine.design_voice_stream("hello", "calm")
+
+    def test_transient_failure_is_retried(self):
+        engine = _gemini_engine()
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[
+                    _dropped(),
+                    _mock_response(_interaction(_pcm_bytes(2))),
+                ],
+            ) as mock_url,
+            patch("time.sleep"),
+        ):
+            audio, _ = engine.synthesize("hello")
+        assert mock_url.call_count == 2
+        assert len(audio) == 2
+
+
+class GeminiStub(BaseHTTPRequestHandler):
+    """minimal interactions api: key header auth, json or sse audio replies."""
+
+    requests: list[dict] = []
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        GeminiStub.requests.append(
+            {
+                "path": self.path,
+                "key": self.headers.get("x-goog-api-key"),
+                "body": body,
+            }
+        )
+        if self.headers.get("x-goog-api-key") != "g-test":
+            self.send_error(401, "API key not valid")
+            return
+        if body.get("stream"):
+            payload = _gemini_events(_pcm_bytes(3), _pcm_bytes(5))
+            content_type = "text/event-stream"
+        else:
+            payload = _interaction(_pcm_bytes(4))
+            content_type = "application/json"
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def log_message(self, *args):
+        pass
+
+
+@pytest.fixture
+def gemini_stub():
+    GeminiStub.requests = []
+    server = HTTPServer(("127.0.0.1", 0), GeminiStub)
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    host, port = server.server_address[:2]
+    yield f"http://{host}:{port}/v1beta"
+    server.shutdown()
+    server.server_close()
+
+
+class TestAgainstGeminiStub:
+    """full request/response cycle over a socket, no mocks."""
+
+    def _engine(self, base: str, key: str = "g-test") -> HTTPTTSEngine:
+        return _gemini_engine(api_base=base, api_key=key, dialect=TTS_DIALECT_GEMINI)
+
+    def test_synthesis_round_trip(self, gemini_stub):
+        audio, sr = self._engine(gemini_stub).synthesize("hello", instruct="calm")
+
+        assert sr == SAMPLE_RATE
+        assert len(audio) == 4
+        sent = GeminiStub.requests[0]
+        assert sent["path"] == "/v1beta/interactions"
+        assert sent["key"] == "g-test"
+
+    def test_stream_round_trip(self, gemini_stub):
+        chunks: list[bytes] = []
+        audio, _ = self._engine(gemini_stub).design_voice_stream(
+            "hello", "calm", on_chunk=chunks.append
+        )
+        assert len(chunks) == 2
+        assert len(audio) == 8
+        assert GeminiStub.requests[0]["path"] == "/v1beta/interactions?alt=sse"
+
+    def test_bad_key_fails_fast_with_the_reason(self, gemini_stub):
+        with pytest.raises(RuntimeError, match="http 401"):
+            self._engine(gemini_stub, key="wrong").synthesize("hello")
+        assert len(GeminiStub.requests) == 1
+
+
+class TestGeminiConfigFromArgs:
+    """the gemini dialect needs neither an endpoint nor a tts-specific key."""
+
+    def _args(self, **kwargs):
+        defaults = dict(
+            api_base=None,
+            api_key=None,
+            tts_api_base=None,
+            tts_api_key=None,
+            tts_dialect="auto",
+            tts_direction="field",
+            tts_voices="",
+            tts_model=GEMINI_MODEL,
+        )
+        return argparse.Namespace(**{**defaults, **kwargs})
+
+    def test_dialect_alone_selects_google(self, monkeypatch):
+        from autiobook.utils import get_tts_config
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-env")
+        config = get_tts_config(self._args(tts_dialect=TTS_DIALECT_GEMINI))
+
+        assert isinstance(config, HTTPTTSConfig)
+        assert config.api_base == GEMINI_API_BASE
+        assert config.api_key == "g-env"
+        assert config.model == GEMINI_MODEL
+
+    def test_google_key_preferred_over_the_shared_one(self, monkeypatch):
+        """the shared key usually belongs to the llm's provider."""
+        from autiobook.utils import get_tts_config
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-env")
+        config = get_tts_config(
+            self._args(
+                api_base=OPENROUTER_BASE,
+                api_key="sk-or-llm",
+                tts_api_base=GEMINI_API_BASE,
+            )
+        )
+        assert config.api_key == "g-env"
+
+    def test_tts_key_wins(self, monkeypatch):
+        from autiobook.utils import get_tts_config
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-env")
+        config = get_tts_config(
+            self._args(tts_dialect=TTS_DIALECT_GEMINI, tts_api_key="g-flag")
+        )
+        assert config.api_key == "g-flag"
+
+    def test_shared_key_used_without_a_google_one(self, monkeypatch):
+        from autiobook.utils import get_tts_config
+
+        monkeypatch.delenv("GEMINI_API_KEY", raising=False)
+        config = get_tts_config(
+            self._args(tts_dialect=TTS_DIALECT_GEMINI, api_key="g-shared")
+        )
+        assert config.api_key == "g-shared"
+
+    def test_other_dialects_ignore_the_google_key(self, monkeypatch):
+        from autiobook.utils import get_tts_config
+
+        monkeypatch.setenv("GEMINI_API_KEY", "g-env")
+        config = get_tts_config(
+            self._args(api_base=OPENROUTER_BASE, api_key="sk-or-test")
+        )
+        assert config.api_key == "sk-or-test"

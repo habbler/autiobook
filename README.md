@@ -315,11 +315,36 @@ and every line comes out flat.
 to keep tts local while the llm runs hosted (or the reverse), set
 `--tts-api-base`/`--tts-api-key` alongside `--api-base`/`--api-key`.
 
+### gemini 3.8 tts (native)
+
+gemini 3.8 tts (`gemini-3.8-flash-tts`, `gemini-3.8-flash-lite-tts`) is
+spoken to directly through google's interactions api with `--tts-dialect
+gemini`, selected automatically for `generativelanguage.googleapis.com`. no
+endpoint is needed: it defaults to google's, and the key comes from
+`--tts-api-key`, then `$GEMINI_API_KEY`, then `--api-key`.
+
+```bash
+export GEMINI_API_KEY=...
+autiobook dramatize book.epub \
+    --tts-dialect gemini --tts-model gemini-3.8-flash-tts --preset-voices
+```
+
+3.8 reads its input as a verbatim transcript, so emotion and voice direction
+always travel as `speech_metadata.style`; `--tts-direction` is ignored, since
+a prefixed direction would be read aloud. takes come back as raw 24khz pcm
+(`AUTIOBOOK_TTS_RESPONSE_FORMAT=wav` also works; mp3 is not served), each request is
+sent with `store: false` so no conversation state is kept server-side, and
+directed casting streams over sse.
+
+voice design and cloning through gemini's `/voices` api are not wired up yet,
+so this dialect also needs `--preset-voices`.
+
 ### available voices
 
 qwen3-tts: Vivian, Ryan, Sunny, Aria, Bella, Nova, Echo, Finn, Atlas
 
-gemini tts (built in, used with `--preset-voices`): Zephyr, Puck, Charon,
+gemini tts, through openrouter or natively (built in, used with
+`--preset-voices`): Zephyr, Puck, Charon,
 Kore, Fenrir, Leda, Orus, Aoede, and 22 more.
 
 ## output

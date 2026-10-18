@@ -19,9 +19,12 @@ from .config import (
     DEFAULT_TTS_DIALECT,
     DEFAULT_TTS_DIRECTION,
     DEFAULT_TTS_MODEL,
+    GEMINI_API_BASE,
+    GEMINI_API_KEY_ENV,
     LEADING_DASH_RE,
     LOG_FILE,
     MAX_CHUNK_SIZE,
+    TTS_DIALECT_GEMINI,
     TTS_DIALECTS,
     TTS_DIRECTIONS,
     VOICE_DESIGN_MODEL,
@@ -261,8 +264,9 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             "--tts-dialect",
             default=DEFAULT_TTS_DIALECT,
             choices=TTS_DIALECTS,
-            help="tts request subset: qwen (local server) or openai (hosted "
-            "providers); auto picks by endpoint host",
+            help="tts request subset: qwen (local server), openai (hosted "
+            "providers) or gemini (google's interactions api, for gemini 3.8 "
+            "tts); auto picks by endpoint host",
         )
         g.add_argument(
             "--tts-voices",
@@ -275,7 +279,8 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             default=DEFAULT_TTS_DIRECTION,
             choices=TTS_DIRECTIONS,
             help="how delivery direction reaches the model: field (top-level "
-            "instructions) or prefix (folded into the input text)",
+            "instructions) or prefix (folded into the input text); the gemini "
+            "dialect always sends it as speech style",
         )
         g.add_argument(
             "--batch-size", type=int, default=64, help="batch size for tts generation"
@@ -532,9 +537,21 @@ def tts_endpoint(args) -> tuple[str, str]:
 
     the split exists so tts and llm can sit on different providers -- a hosted
     tts backend with a local llm, or the reverse.
+
+    the gemini dialect needs no endpoint: it defaults to google's, and takes
+    $GEMINI_API_KEY ahead of the shared key, which is usually another
+    provider's when only tts runs on gemini.
     """
+    from .tts_http import resolve_dialect
+
+    dialect = getattr(args, "tts_dialect", None) or DEFAULT_TTS_DIALECT
+    tts_key = getattr(args, "tts_api_key", None)
     base = getattr(args, "tts_api_base", None) or getattr(args, "api_base", None) or ""
-    key = getattr(args, "tts_api_key", None) or getattr(args, "api_key", None) or ""
+    if not base and dialect == TTS_DIALECT_GEMINI:
+        base = GEMINI_API_BASE
+    if not tts_key and resolve_dialect(dialect, base) == TTS_DIALECT_GEMINI:
+        tts_key = os.getenv(GEMINI_API_KEY_ENV)
+    key = tts_key or getattr(args, "api_key", None) or ""
     return base, key
 
 

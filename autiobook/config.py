@@ -102,14 +102,28 @@ TTS_RETRY_STATUS = {408, 425, 429, 500, 502, 503, 504}
 # sse streaming, /audio/voices for listing and cloning, and sampler fields.
 # "openai" is the strict subset hosted providers accept (openrouter, openai):
 # model/input/voice/response_format/instructions answered as raw audio bytes.
+# "gemini" is google's native interactions api (gemini 3.8 tts and later):
+# x-goog-api-key auth, json-wrapped base64 audio, delivery in
+# speech_metadata.style rather than anywhere in the transcript.
 # "auto" picks by host, since a hosted endpoint rejects the qwen extensions
 # and bills for the attempt.
 TTS_DIALECT_AUTO = "auto"
 TTS_DIALECT_QWEN = "qwen"
 TTS_DIALECT_OPENAI = "openai"
-TTS_DIALECTS = [TTS_DIALECT_AUTO, TTS_DIALECT_QWEN, TTS_DIALECT_OPENAI]
+TTS_DIALECT_GEMINI = "gemini"
+TTS_DIALECTS = [
+    TTS_DIALECT_AUTO,
+    TTS_DIALECT_QWEN,
+    TTS_DIALECT_OPENAI,
+    TTS_DIALECT_GEMINI,
+]
 DEFAULT_TTS_DIALECT = os.getenv("AUTIOBOOK_TTS_DIALECT", TTS_DIALECT_AUTO)
 OPENAI_DIALECT_HOSTS = ["openrouter.ai", "api.openai.com"]
+GEMINI_DIALECT_HOSTS = ["generativelanguage.googleapis.com"]
+GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
+# the gemini dialect falls back to google's own key variable, so a key set for
+# the llm (litellm reads the same one) does not need repeating for tts.
+GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
 # speech response formats. openrouter serves pcm (its default) or mp3 and
 # never wav; the local server serves wav. "" resolves from the dialect.
 TTS_FORMAT_WAV = "wav"
@@ -117,6 +131,9 @@ TTS_FORMAT_PCM = "pcm"
 TTS_FORMAT_MP3 = "mp3"
 TTS_RESPONSE_FORMATS = [TTS_FORMAT_WAV, TTS_FORMAT_PCM, TTS_FORMAT_MP3]
 DEFAULT_TTS_RESPONSE_FORMAT = os.getenv("AUTIOBOOK_TTS_RESPONSE_FORMAT", "")
+# gemini mime type per response format; it serves no mp3. unary replies
+# default to wav and streams to l16, so pcm is asked for by name on both.
+GEMINI_MIME_TYPES = {TTS_FORMAT_PCM: "audio/l16", TTS_FORMAT_WAV: "audio/wav"}
 # preset voice names for backends with no /audio/voices endpoint. openrouter
 # publishes no voice discovery api, so --preset-voices needs them supplied.
 TTS_PRESET_VOICES = [
@@ -125,8 +142,9 @@ TTS_PRESET_VOICES = [
 # how delivery direction reaches the model. "field" sends a top-level
 # instructions field, which the qwen server and openai's own api read.
 # openrouter documents no such field, so "prefix" folds the direction into the
-# input text instead -- how gemini tts takes direction, and the only channel
-# left on a provider that drops unknown fields.
+# input text instead -- how gemini tts before 3.8 took direction, and the only
+# channel left on a provider that drops unknown fields. the gemini dialect
+# ignores this: 3.8 reads its input verbatim and takes direction as style.
 TTS_DIRECTION_FIELD = "field"
 TTS_DIRECTION_PREFIX = "prefix"
 TTS_DIRECTIONS = [TTS_DIRECTION_FIELD, TTS_DIRECTION_PREFIX]

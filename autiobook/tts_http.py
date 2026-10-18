@@ -19,10 +19,13 @@ from .config import (
     DEFAULT_TTS_DIALECT,
     DEFAULT_TTS_DIRECTION,
     DEFAULT_TTS_RESPONSE_FORMAT,
+    GEMINI_DIALECT_HOSTS,
+    GEMINI_MIME_TYPES,
     MAX_CHUNK_SIZE,
     OPENAI_DIALECT_HOSTS,
     SAMPLE_RATE,
     TTS_DIALECT_AUTO,
+    TTS_DIALECT_GEMINI,
     TTS_DIALECT_OPENAI,
     TTS_DIALECT_QWEN,
     TTS_DIRECTION_PREFIX,
@@ -141,12 +144,15 @@ class HTTPTTSConfig:
 def resolve_dialect(dialect: str, api_base: str) -> str:
     """resolve `auto` to a concrete dialect from the endpoint host.
 
-    hosted providers accept only the strict openai subset; anything else is
-    assumed to be the local qwen3-tts server, whose api is a superset.
+    hosted providers accept only the strict openai subset and google speaks
+    its own api; anything else is assumed to be the local qwen3-tts server,
+    whose api is a superset of openai's.
     """
     if dialect != TTS_DIALECT_AUTO:
         return dialect
     host = urllib.parse.urlparse(api_base).hostname or ""
+    if host in GEMINI_DIALECT_HOSTS:
+        return TTS_DIALECT_GEMINI
     return TTS_DIALECT_OPENAI if host in OPENAI_DIALECT_HOSTS else TTS_DIALECT_QWEN
 
 
@@ -154,12 +160,31 @@ def resolve_response_format(response_format: str, dialect: str) -> str:
     """speech response format, defaulted to what the dialect's servers emit."""
     if response_format:
         return response_format
-    return TTS_FORMAT_PCM if dialect == TTS_DIALECT_OPENAI else TTS_FORMAT_WAV
+    return TTS_FORMAT_WAV if dialect == TTS_DIALECT_QWEN else TTS_FORMAT_PCM
 
 
 def _auth_headers(api_key: str) -> dict[str, str]:
     """bearer auth for hosted backends; empty for an unauthenticated server."""
     return {"Authorization": f"Bearer {api_key}"} if api_key else {}
+
+
+def _gemini_audio(interaction: dict) -> bytes:
+    """the audio an interactions api reply carries, decoded from base64.
+
+    audio sits in the model_output steps' content blocks; the last block is
+    the take, as the sdk's output_audio property reads it.
+    """
+    blocks = [
+        block
+        for step in interaction.get("steps") or []
+        if isinstance(step, dict) and step.get("type") == "model_output"
+        for block in step.get("content") or []
+        if isinstance(block, dict) and block.get("type") == "audio"
+    ]
+    if not blocks or not blocks[-1].get("data"):
+        status = interaction.get("status", "unknown")
+        raise RuntimeError(f"gemini tts reply contained no audio (status {status})")
+    return base64.b64decode(blocks[-1]["data"])
 
 
 # transport failures urllib hands back rather than wraps: reset or refused
@@ -199,18 +224,35 @@ def _request(
 
 
 def _json_request(
-    url: str, body: dict, api_key: str, sse: bool = False
+    url: str,
+    body: dict,
+    api_key: str,
+    sse: bool = False,
+    headers: dict[str, str] | None = None,
 ) -> urllib.request.Request:
-    """a POST carrying a json body, optionally asking for an sse reply."""
-    headers = {"Content-Type": "application/json", **_auth_headers(api_key)}
+    """a POST carrying a json body, optionally asking for an sse reply.
+
+    `headers` carries auth for a provider that does not take a bearer token.
+    """
+    all_headers = {
+        "Content-Type": "application/json",
+        **_auth_headers(api_key),
+        **(headers or {}),
+    }
     if sse:
-        headers["Accept"] = "text/event-stream"
-    return urllib.request.Request(url, data=json.dumps(body).encode(), headers=headers)
+        all_headers["Accept"] = "text/event-stream"
+    return urllib.request.Request(
+        url, data=json.dumps(body).encode(), headers=all_headers
+    )
 
 
-def _get_json(url: str, api_key: str = "") -> dict:
+def _get_json(
+    url: str, api_key: str = "", headers: dict[str, str] | None = None
+) -> dict:
     """GET url, return parsed json response."""
-    req = urllib.request.Request(url, headers=_auth_headers(api_key))
+    req = urllib.request.Request(
+        url, headers={**_auth_headers(api_key), **(headers or {})}
+    )
 
     def attempt() -> dict:
         with urllib.request.urlopen(req, timeout=TTS_HTTP_TIMEOUT) as resp:
@@ -253,13 +295,21 @@ def _read_sse(
             obj = json.loads(payload)
         except json.JSONDecodeError:
             return
+        audio = None
         if event_name == "speech.audio.delta":
             audio = obj.get("audio")
-            if isinstance(audio, str):
-                chunk = base64.b64decode(audio)
-                parts.append(chunk)
-                if on_chunk is not None:
-                    on_chunk(chunk)
+        elif event_name == "step.delta":
+            # gemini interactions stream; other step deltas carry no audio
+            delta = obj.get("delta")
+            if isinstance(delta, dict) and delta.get("type") == "audio":
+                audio = delta.get("data")
+        elif event_name == "error":
+            raise RuntimeError(f"tts stream error: {payload}")
+        if isinstance(audio, str):
+            chunk = base64.b64decode(audio)
+            parts.append(chunk)
+            if on_chunk is not None:
+                on_chunk(chunk)
         elif event_name == "speech.audio.done":
             if isinstance(obj.get("usage"), dict):
                 usage = obj["usage"]
@@ -291,6 +341,7 @@ def _post_sse(
     on_chunk: Any | None = None,
     cancel: Any | None = None,
     api_key: str = "",
+    headers: dict[str, str] | None = None,
 ) -> tuple[bytes, dict, dict]:
     """POST json body, parse the SSE reply, return (audio, usage, timings).
 
@@ -299,7 +350,7 @@ def _post_sse(
     (response_format=pcm, stream_batch_size>0). a failure after any of the
     take has been handed over is final -- a retry would replay its opening.
     """
-    req = _json_request(url, body, api_key, sse=True)
+    req = _json_request(url, body, api_key, sse=True, headers=headers)
     delivered = False
 
     def relay(chunk: bytes) -> None:
@@ -327,6 +378,7 @@ def _post_stream(
     on_chunk: Any | None = None,
     cancel: Any | None = None,
     api_key: str = "",
+    headers: dict[str, str] | None = None,
 ) -> bytes:
     """POST json, call on_chunk(bytes) as the audio body arrives, return it all.
 
@@ -338,7 +390,7 @@ def _post_stream(
     (partial audio is still returned). as with _post_sse, audio already handed
     to on_chunk rules out another attempt.
     """
-    req = _json_request(url, body, api_key)
+    req = _json_request(url, body, api_key, headers=headers)
     delivered = False
 
     def attempt() -> bytes:
@@ -361,9 +413,11 @@ def _post_stream(
     return _request(attempt, lambda e: not delivered and _retryable(e))
 
 
-def _post_json(url: str, body: dict, api_key: str = "") -> bytes:
+def _post_json(
+    url: str, body: dict, api_key: str = "", headers: dict[str, str] | None = None
+) -> bytes:
     """send json post request, return response bytes."""
-    req = _json_request(url, body, api_key)
+    req = _json_request(url, body, api_key, headers=headers)
 
     def attempt() -> bytes:
         with urllib.request.urlopen(req, timeout=TTS_HTTP_TIMEOUT) as resp:
@@ -449,7 +503,7 @@ def _numpy_to_wav_bytes(audio: np.ndarray, sample_rate: int = SAMPLE_RATE) -> by
 
 
 class HTTPTTSEngine:
-    """tts engine that calls an openai-compatible speech api."""
+    """tts engine that calls an openai-compatible or gemini speech api."""
 
     def __init__(self, config: HTTPTTSConfig | None = None):
         self.config = config or HTTPTTSConfig()
@@ -467,36 +521,45 @@ class HTTPTTSEngine:
     def seeded(self) -> bool:
         """whether the backend varies output with the seed field.
 
-        hosted providers document no seed on /audio/speech, so retries there
+        hosted providers document no seed for speech, so retries there
         explore fresh samples but cannot be reproduced.
         """
-        return self.dialect != TTS_DIALECT_OPENAI
+        return self.dialect == TTS_DIALECT_QWEN
 
     @property
     def streaming(self) -> bool:
         """whether takes can play while they render.
 
         the qwen server streams only when asked for a batch size; a hosted
-        provider answers every request as a byte stream, so it always can.
+        provider streams any request that asks, so it always can.
         """
-        if self.dialect == TTS_DIALECT_OPENAI:
+        if self.dialect != TTS_DIALECT_QWEN:
             return True
         return self.config.stream_batch_size > 0
 
     def _speech_url(self) -> str:
+        if self.dialect == TTS_DIALECT_GEMINI:
+            return f"{self.config.api_base}/interactions"
         return f"{self.config.api_base}/audio/speech"
+
+    def _auth(self) -> dict[str, Any]:
+        """auth kwargs for the request helpers: a bearer token, or google's
+        key header, which takes no bearer prefix."""
+        if self.dialect == TTS_DIALECT_GEMINI:
+            return {"headers": {"x-goog-api-key": self.config.api_key}}
+        return {"api_key": self.config.api_key}
 
     def _voices_url(self) -> str:
         return f"{self.config.api_base}/audio/voices"
 
     def _require_qwen(self, feature: str) -> None:
-        """reject a qwen-server-only feature on a hosted openai backend.
+        """reject a qwen-server-only feature on a hosted backend.
 
         hosted cloning exists but is a different mechanism (openrouter's
-        stateless input_references, sent per request) that this engine does
-        not speak yet, so preset voices are the supported route.
+        stateless input_references, gemini's /voices resource) that this
+        engine does not speak yet, so preset voices are the supported route.
         """
-        if self.dialect == TTS_DIALECT_OPENAI:
+        if self.dialect != TTS_DIALECT_QWEN:
             raise RuntimeError(
                 f"{feature} needs the qwen tts server; {self.config.api_base} "
                 "serves preset voices only (run audition with --preset-voices)"
@@ -511,7 +574,7 @@ class HTTPTTSEngine:
         configured = self.config.voices or known_voices(self.config.model)
         if configured:
             return list(configured)
-        if self.dialect == TTS_DIALECT_OPENAI:
+        if self.dialect != TTS_DIALECT_QWEN:
             raise RuntimeError(
                 f"{self.config.api_base} has no /audio/voices endpoint and no "
                 f"voices are known for '{self.config.model}'; pass --tts-voices "
@@ -537,6 +600,8 @@ class HTTPTTSEngine:
         they are silently dropped at best and rejected at worst, and a rejected
         request is still a billable round trip.
         """
+        if self.dialect == TTS_DIALECT_GEMINI:
+            return self._gemini_body(text, voice, instruct)
         if instruct and self.config.direction == TTS_DIRECTION_PREFIX:
             text = TTS_DIRECTION_TEMPLATE.format(instruct=instruct, text=text)
             instruct = ""
@@ -563,6 +628,45 @@ class HTTPTTSEngine:
             body["seed"] = self.config.seed
         return body
 
+    def _gemini_body(
+        self,
+        text: str,
+        voice: str = "",
+        instruct: str = "",
+        response_format: str = "",
+    ) -> dict[str, Any]:
+        """build an interactions api body for a single-speaker take.
+
+        gemini 3.8 reads `text` as a verbatim transcript, so direction always
+        travels as speech_metadata.style, whatever --tts-direction says: a
+        prefixed direction would be spoken. store=false keeps each take from
+        being retained server-side as conversation state nobody resumes.
+        """
+        response_format = response_format or self.response_format
+        mime_type = GEMINI_MIME_TYPES.get(response_format)
+        if mime_type is None:
+            raise RuntimeError(
+                f"gemini tts cannot serve response format "
+                f"'{response_format}'; use one of "
+                f"{', '.join(GEMINI_MIME_TYPES)}"
+            )
+        content: dict[str, Any] = {"type": "text", "text": text}
+        if instruct:
+            content["annotations"] = [{"type": "speech_metadata", "style": instruct}]
+        return {
+            "model": self.config.model,
+            "input": [{"type": "user_input", "content": [content]}],
+            "response_format": {
+                "type": "audio",
+                "mime_type": mime_type,
+                "sample_rate": SAMPLE_RATE,
+            },
+            "generation_config": {
+                "speech_config": [{"voice": voice or self.config.speaker}]
+            },
+            "store": False,
+        }
+
     def _synthesize_one(
         self, text: str, voice: str = "", instruct: str = ""
     ) -> np.ndarray:
@@ -570,6 +674,10 @@ class HTTPTTSEngine:
         body = self._speech_body(text, voice, instruct)
         url = self._speech_url()
         key = self.config.api_key
+
+        if self.dialect == TTS_DIALECT_GEMINI:
+            reply = json.loads(_post_json(url, body, **self._auth()))
+            return _decode_audio(_gemini_audio(reply), self.response_format)
 
         # the qwen server is asked over SSE first so llama-swap can record
         # usage/timings. hosted providers answer with raw bytes, so probing
@@ -600,6 +708,10 @@ class HTTPTTSEngine:
 
     def design_voice(self, text: str, instruct: str) -> tuple[np.ndarray, int]:
         """generate speech with voice design instruction."""
+        if self.dialect == TTS_DIALECT_GEMINI:
+            # style shapes delivery, not identity: gemini builds a voice from
+            # a description only through its /voices resource
+            self._require_qwen("voice design")
         return self._synthesize_one(text, instruct=instruct), SAMPLE_RATE
 
     def design_voice_stream(
@@ -616,12 +728,29 @@ class HTTPTTSEngine:
         pcm is forced regardless of the configured response format: the player
         is fed raw samples, and a container would arrive header-first.
         """
+        url = self._speech_url()
+        key = self.config.api_key
+
+        if self.dialect == TTS_DIALECT_GEMINI:
+            # gemini streams json events rather than a bare body; alt=sse asks
+            # for them framed as server-sent events
+            body = {
+                **self._gemini_body(text, voice, instruct, TTS_FORMAT_PCM),
+                "stream": True,
+            }
+            pcm_bytes, _usage, _timings = _post_sse(
+                f"{url}?alt=sse",
+                body,
+                on_chunk=on_chunk,
+                cancel=cancel,
+                **self._auth(),
+            )
+            return _pcm_bytes_to_numpy(pcm_bytes), SAMPLE_RATE
+
         body = {
             **self._speech_body(text, voice, instruct),
             "response_format": TTS_FORMAT_PCM,
         }
-        url = self._speech_url()
-        key = self.config.api_key
 
         # the qwen server emits pcm inside sse deltas and needs a batch size;
         # hosted providers just stream the response body.
