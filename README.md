@@ -255,7 +255,8 @@ environment variables (also loadable from `.env`; see `.env.example`):
 `AUTIOBOOK_TTS_MODEL`, `AUTIOBOOK_TTS_API_BASE`, `AUTIOBOOK_TTS_API_KEY`,
 `AUTIOBOOK_TTS_DIALECT`, `AUTIOBOOK_TTS_VOICES`, `AUTIOBOOK_TTS_DIRECTION`,
 `AUTIOBOOK_TTS_RESPONSE_FORMAT`, `AUTIOBOOK_TTS_MAX_RETRIES`,
-`AUTIOBOOK_TTS_RETRY_DELAY`.
+`AUTIOBOOK_TTS_RETRY_DELAY`, `AUTIOBOOK_SERIES`,
+`AUTIOBOOK_DESIGN_MIN_MENTIONS`.
 
 ### hosted tts backends
 
@@ -336,8 +337,67 @@ a prefixed direction would be read aloud. takes come back as raw 24khz pcm
 sent with `store: false` so no conversation state is kept server-side, and
 directed casting streams over sse.
 
-voice design and cloning through gemini's `/voices` api are not wired up yet,
-so this dialect also needs `--preset-voices`.
+`--design-voices` (which implies `--preset-voices`) goes past the 30 prebuilt
+voices: gemini designs a stored custom voice (`voice_...`) for each named
+character from its voice prompt, which is google's recommended way to keep a
+character's identity steady. with `--directed` you hear each design say the
+audition line and can keep it, ask for another, edit the prompt, or fall back
+to the preset list. rejected designs are deleted straight away.
+
+a google project holds at most 200 stored voices, and a voice expires after a
+year without use, so designing is held back for characters who matter:
+
+- the narrator is always designed. `Extra Female` and `Extra Male` never
+  are, since they voice whoever the script could not name.
+- everyone else needs `AUTIOBOOK_DESIGN_MIN_MENTIONS` (8) mentions, by name
+  or alias, in the book's text. walk-ons keep preset voices.
+- each run counts the project's stored voices first and falls back to
+  presets once the quota is spent.
+- `--force` re-renders takes but never discards a designed voice, which
+  would strand its quota slot for a year. to redesign one, remove it from
+  `audition/voices.json` (and the series file).
+
+voice cloning through gemini's `/voices` api is not wired up yet.
+
+### series casts
+
+`--series path/to/series.json` (or `$AUTIOBOOK_SERIES`) shares one cast and
+its voice bindings across every book in a series. the link is recorded in
+the book's `series_link.json`, so later runs of that book need not repeat
+the flag. passing a different file moves the book to that series.
+
+```bash
+autiobook dramatize book1.epub --series mistborn.json \
+    --tts-dialect gemini --tts-model gemini-3.8-flash-tts --design-voices
+autiobook dramatize book2.epub --series mistborn.json \
+    --tts-dialect gemini --tts-model gemini-3.8-flash-tts --design-voices
+```
+
+- **cast:** before the llm reads a book, every series character its text
+  names at least twice joins the cast, so the llm sees them as known and
+  keeps their names. a series character's description, voice prompt and
+  audition line are locked: the llm cannot rewrite them or merge the
+  character away. new aliases are still learned and carried to the next
+  book. a character the llm finds under one of their aliases is renamed to
+  their series name.
+- **audition:** every series character speaks with their bound voice. new
+  characters get designed voices (`--design-voices`) or presets the series
+  has not used yet, so a newcomer does not inherit the hero's voice. the
+  book's cast and voices are then written back to the series file.
+- **expiry:** a designed voice google has deleted is designed again from the
+  prompt recorded in the series file. the result is close to the original
+  but not identical, and the run says so. google's preview clip of each
+  designed voice is kept in `<series>_voices/` beside the series file.
+
+the series file is the source of truth. edit it to recast or redescribe a
+character for every later book; to recast one, remove its `binding`. each
+entry also takes optional `gender` (`female`, `male`, `neutral`) and
+`language_code` (bcp-47, e.g. `en-GB`) fields, which are passed to voice
+design.
+
+voices are bound only in preset mode (`--preset-voices` or
+`--design-voices`). with the local qwen server, the series still locks the
+cast, but each book designs its own clips.
 
 ### available voices
 
@@ -374,6 +434,7 @@ Intermediate files are organized into subdirectories by command:
 ```
 workdir/
 ├── seed.json              # seed recorded for this book, reused on resume
+├── series_link.json       # the series file this book belongs to (--series)
 ├── extract/               # extracted text and metadata
 │   ├── metadata.json
 │   ├── cover.jpg

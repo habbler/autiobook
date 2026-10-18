@@ -124,6 +124,13 @@ GEMINI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 # the gemini dialect falls back to google's own key variable, so a key set for
 # the llm (litellm reads the same one) does not need repeating for tts.
 GEMINI_API_KEY_ENV = "GEMINI_API_KEY"
+# stored custom voices (designed or replicated) a google project may hold.
+# designing past it fails, so each run counts what is stored first.
+GEMINI_VOICE_QUOTA = 200
+# characters named in fewer places than this get a preset voice rather than a
+# designed one: the quota is per project, so a series spending it on walk-ons
+# runs out by book three. names and aliases are counted in the book's text.
+DESIGN_MIN_MENTIONS = int(os.getenv("AUTIOBOOK_DESIGN_MIN_MENTIONS", "8"))
 # speech response formats. openrouter serves pcm (its default) or mp3 and
 # never wav; the local server serves wav. "" resolves from the dialect.
 TTS_FORMAT_WAV = "wav"
@@ -318,3 +325,20 @@ DEFAULT_CAST = [
         ),
     },
 ]
+NARRATOR_NAME = "Narrator"
+# the stand-ins for unnamed speakers: never given a designed voice, since
+# they voice whoever the script could not name
+EXTRA_CAST_NAMES = frozenset(
+    c["name"] for c in DEFAULT_CAST if c["name"] != NARRATOR_NAME
+)
+
+# series file: one cast and its voice bindings shared by every book in a
+# series. a book records which series it belongs to in SERIES_LINK_FILE, so
+# a resumed run keeps its locks without --series being passed again.
+SERIES_LINK_FILE = "series_link.json"
+SERIES_ENV = "AUTIOBOOK_SERIES"
+SERIES_VERSION = 1
+# how a series character's voice is held: a preset name from the backend's
+# fixed list, or a custom voice id created by gemini voice design
+BINDING_PRESET = "preset"
+BINDING_DESIGNED = "designed"

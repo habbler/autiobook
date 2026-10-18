@@ -255,12 +255,17 @@ def _merge_character_into_cast(
     alias_map: dict[str, str],
     verbose: bool = False,
     overwrite_audition_line: bool = False,
+    locked: set[str] | frozenset[str] = frozenset(),
 ) -> str:
     """merge a character into the cast, returns 'added', 'updated', or 'merged'.
 
     an incoming audition line only fills a gap: llm-written lines (under
     --llm-audition-lines) must not overwrite one a person wrote. `design --text`
     sets overwrite_audition_line to change one deliberately.
+
+    a character named in `locked` (casefolded) belongs to the book's series:
+    it learns new aliases, but its description, voice prompt and audition line
+    are the series' and stay as they are.
     """
     existing, merge_source = _find_existing_character(c, cast_map, alias_map)
 
@@ -307,6 +312,15 @@ def _merge_character_into_cast(
         # refresh alias_map for newly added aliases
         for a in added_aliases:
             alias_map[a.lower()] = existing_low
+
+        if existing.name.casefold() in locked:
+            if verbose:
+                label = "merged" if merge_source else "updated"
+                detail = f" ({'; '.join(diff_parts)})" if diff_parts else ""
+                print(f"  {label} series character '{existing.name}'{detail}")
+            if merge_source:
+                return "merged"
+            return "updated" if diff_parts else "unchanged"
 
         if c.description and c.description != existing.description:
             diff_parts.extend(
@@ -371,12 +385,15 @@ def _apply_cast_merge(
     cast_map: dict[str, Character],
     alias_map: dict[str, str],
     verbose: bool = False,
+    locked: set[str] | frozenset[str] = frozenset(),
 ) -> dict | None:
     """apply an llm-directed merge, returning an audit-ready record or None.
 
     characters named in `merge.from_` are removed from the cast and their
     aliases (plus their canonical names) are added to the survivor named
-    `merge.into`. missing references are skipped with a verbose warning.
+    `merge.into`. missing references are skipped with a verbose warning. a
+    series character (named in `locked`) may absorb others but is never
+    folded away: its identity spans books this one cannot see.
     """
     into_key = merge.into.lower()
     target = cast_map.get(into_key)
@@ -402,6 +419,9 @@ def _apply_cast_merge(
                 src_key = source_key
         if source is None or source is target:
             skipped.append(src)
+            continue
+        if source.name.casefold() in locked:
+            skipped.append(f"{src} (series character)")
             continue
         new_aliases = {source.name, *(source.aliases or [])}
         for a in new_aliases:
@@ -535,6 +555,7 @@ def _process_cast_batch(
     progress: Any = None,
     merge_events: list[dict] | None = None,
     audition_lines: bool = False,
+    locked: set[str] | frozenset[str] = frozenset(),
 ) -> int:
     """process a single batch of chapters, chunked for coreference context.
 
@@ -581,7 +602,9 @@ def _process_cast_batch(
         outcomes: Counter[str] = Counter()
         for c in chunk_cast:
             outcomes[
-                _merge_character_into_cast(c, cast_map, alias_map, verbose=verbose)
+                _merge_character_into_cast(
+                    c, cast_map, alias_map, verbose=verbose, locked=locked
+                )
             ] += 1
         if verbose and outcomes:
             print(
@@ -589,7 +612,9 @@ def _process_cast_batch(
                 + ", ".join(f"{n} {k}" for k, n in sorted(outcomes.items()))
             )
         for m in chunk_merges:
-            event = _apply_cast_merge(m, cast_map, alias_map, verbose=verbose)
+            event = _apply_cast_merge(
+                m, cast_map, alias_map, verbose=verbose, locked=locked
+            )
             if event is not None and merge_events is not None:
                 event = {
                     **event,
@@ -622,8 +647,17 @@ def run_cast_generation(
     when `accept` is True, skip llm analysis and mark the existing cast as
     fresh under current chapter hashes. useful after hand-editing
     cast/characters.json to lock it in without re-analyzing.
+
+    a book linked to a series starts from the series characters its text
+    names, and every series character keeps its series form throughout.
     """
+    from .series import load_series_for
+
     existing_cast = load_cast(workdir)
+    series = load_series_for(workdir)
+    locked: set[str] = set()
+    if series is not None:
+        existing_cast, locked = _apply_series(workdir, existing_cast, series, seed=True)
     resume = ResumeManager.for_command(workdir, "cast", force=force)
 
     extract_dir = get_command_dir(workdir, "extract")
@@ -687,6 +721,7 @@ def run_cast_generation(
                 progress=progress,
                 merge_events=merge_events,
                 audition_lines=audition_lines,
+                locked=locked,
             )
 
             for num in batch_chapters:
@@ -699,7 +734,38 @@ def run_cast_generation(
     if merge_events:
         _append_cast_merge_audit(workdir, merge_events)
 
-    return list(cast_map.values())
+    final_cast = list(cast_map.values())
+    if series is not None:
+        # a character the llm introduced under a series alias, or one the
+        # seeding missed, only shows up as a series character now
+        final_cast, _ = _apply_series(workdir, final_cast, series, seed=False)
+    return final_cast
+
+
+def _cast_snapshot(cast: List[Character]) -> list[tuple]:
+    return [
+        (c.name, c.description, c.voice_prompt(), c.aliases, c.audition_line)
+        for c in cast
+    ]
+
+
+def _apply_series(
+    workdir: Path, cast: List[Character], series: Any, seed: bool
+) -> tuple[List[Character], set[str]]:
+    """lock a book's cast to its series (seeding it first when `seed`),
+    saving the cast if that changed it. returns (cast, locked names)."""
+    from .series import book_text, lock_cast, seed_cast
+
+    before = _cast_snapshot(cast)
+    if seed:
+        cast, locked, notes = seed_cast(cast, series, book_text(workdir))
+    else:
+        cast, locked, notes = lock_cast(cast, series)
+    for note in notes:
+        print(f"series: {note}")
+    if _cast_snapshot(cast) != before:
+        _save_cast_narrator_first(workdir, {c.name.lower(): c for c in cast})
+    return cast, locked
 
 
 def _append_cast_merge_audit(workdir: Path, events: list[dict]) -> None:
@@ -3754,6 +3820,7 @@ def dramatize_book(
     chapter_wise: bool = False,
     audition_lines: bool = False,
     export_fn: Any = None,
+    design_voices: bool = False,
 ) -> None:
     """run full dramatization pipeline.
 
@@ -3804,6 +3871,7 @@ def dramatize_book(
             preset_voices=preset_voices,
             directed=directed,
             accept=accept,
+            design_voices=design_voices,
         )
         _step_if_changed(step, "audition", get_command_dir(workdir, "audition"), before)
 

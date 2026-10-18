@@ -1167,3 +1167,148 @@ class TestGeminiConfigFromArgs:
             self._args(api_base=OPENROUTER_BASE, api_key="sk-or-test")
         )
         assert config.api_key == "sk-or-test"
+
+
+def _gemini_http_error(code: int) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        f"{GEMINI_API_BASE}/voices", code, "err", {}, io.BytesIO(b"{}")
+    )
+
+
+class TestGeminiVoiceApi:
+    """stored custom voices: design, existence, deletion, quota counting."""
+
+    def _created(self, **extra) -> bytes:
+        return json.dumps(
+            {
+                "id": "voice_abc",
+                "type": "prompted",
+                "sample_audio": {
+                    "mime_type": "audio/wav",
+                    "data": base64.b64encode(b"RIFF").decode(),
+                },
+                **extra,
+            }
+        ).encode()
+
+    def test_design_request(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(self._created())
+        ) as mock_url:
+            voice_id, sample = engine.create_designed_voice(
+                "A gruff sailor.", "mistborn: Clubs", gender="male"
+            )
+
+        assert voice_id == "voice_abc"
+        assert sample == b"RIFF"
+        req = mock_url.call_args[0][0]
+        assert req.full_url == f"{GEMINI_API_BASE}/voices"
+        assert req.get_header("X-goog-api-key") == "g-test"
+        assert _bodies(mock_url)[0] == {
+            "store": True,
+            "voice": {
+                "model": GEMINI_MODEL,
+                "type": "prompted",
+                "display_name": "mistborn: Clubs",
+                "prompted": {"input": "A gruff sailor."},
+                "gender": "male",
+            },
+        }
+
+    def test_design_accepts_a_resource_name(self):
+        reply = json.dumps({"name": "voices/voice_xyz"}).encode()
+        with patch("urllib.request.urlopen", return_value=_mock_response(reply)):
+            voice_id, sample = _gemini_engine().create_designed_voice("p", "n")
+        assert voice_id == "voice_xyz"
+        assert sample is None
+
+    def test_design_without_an_id_fails(self):
+        with patch("urllib.request.urlopen", return_value=_mock_response(b"{}")):
+            with pytest.raises(RuntimeError, match="no voice id"):
+                _gemini_engine().create_designed_voice("p", "n")
+
+    def test_dropped_design_is_not_resent(self):
+        """the voice may exist already; a resend would spend quota on a twin."""
+        with (
+            patch("urllib.request.urlopen", side_effect=_dropped()) as mock_url,
+            patch("time.sleep"),
+        ):
+            with pytest.raises(http.client.RemoteDisconnected):
+                _gemini_engine().create_designed_voice("p", "n")
+        assert mock_url.call_count == 1
+
+    def test_refused_design_is_retried(self):
+        with (
+            patch(
+                "urllib.request.urlopen",
+                side_effect=[_gemini_http_error(503), _mock_response(self._created())],
+            ) as mock_url,
+            patch("time.sleep"),
+        ):
+            voice_id, _ = _gemini_engine().create_designed_voice("p", "n")
+        assert voice_id == "voice_abc"
+        assert mock_url.call_count == 2
+
+    def test_voice_exists(self):
+        engine = _gemini_engine()
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(b'{"id": "voice_a"}')
+        ) as mock_url:
+            assert engine.voice_exists("voice_a") is True
+        assert mock_url.call_args[0][0].full_url == f"{GEMINI_API_BASE}/voices/voice_a"
+
+    def test_expired_voice_does_not_exist(self):
+        with patch("urllib.request.urlopen", side_effect=_gemini_http_error(404)):
+            assert _gemini_engine().voice_exists("voice_a") is False
+
+    def test_other_failures_are_not_taken_as_expiry(self):
+        with patch("urllib.request.urlopen", side_effect=_gemini_http_error(403)):
+            with pytest.raises(RuntimeError, match="http 403"):
+                _gemini_engine().voice_exists("voice_a")
+
+    def test_delete(self):
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(b"{}")
+        ) as mock_url:
+            _gemini_engine().delete_voice("voice_a")
+        req = mock_url.call_args[0][0]
+        assert req.get_method() == "DELETE"
+        assert req.full_url == f"{GEMINI_API_BASE}/voices/voice_a"
+
+    def test_deleting_a_gone_voice_is_fine(self):
+        with patch("urllib.request.urlopen", side_effect=_gemini_http_error(404)):
+            _gemini_engine().delete_voice("voice_a")
+
+    def test_count_pages_through_stored_voices(self):
+        pages = [
+            {
+                "voices": [{"id": "voice_1", "type": "prompted"}] * 3,
+                "next_page_token": "t2",
+            },
+            {"voices": [{"id": "voice_2", "type": "replicated"}]},
+        ]
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=[_mock_response(json.dumps(p).encode()) for p in pages],
+        ) as mock_url:
+            assert _gemini_engine().count_stored_voices() == 4
+
+        first, second = (c[0][0].full_url for c in mock_url.call_args_list)
+        assert "type=prompted" in first and "type=replicated" in first
+        assert "page_token=t2" in second
+
+    def test_prebuilt_voices_are_not_counted(self):
+        reply = {"voices": [{"id": "Kore", "type": "prebuilt"}]}
+        with patch(
+            "urllib.request.urlopen",
+            return_value=_mock_response(json.dumps(reply).encode()),
+        ):
+            assert _gemini_engine().count_stored_voices() == 0
+
+    def test_other_backends_refuse(self):
+        engine = _engine(api_base=OPENROUTER_BASE)
+        with pytest.raises(RuntimeError, match="--tts-dialect gemini"):
+            engine.create_designed_voice("p", "n")
+        with pytest.raises(RuntimeError, match="--tts-dialect gemini"):
+            engine.voice_exists("voice_a")

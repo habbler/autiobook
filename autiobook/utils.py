@@ -378,6 +378,14 @@ def add_common_args(parser: argparse.ArgumentParser, group: str = "all"):
             "for characters that have none; a line already in characters.json "
             "is never overwritten",
         )
+        g.add_argument(
+            "--series",
+            default=None,
+            help="series file shared by every book in a series: locks its "
+            "characters and their voices across books. recorded in the "
+            "workdir, so later runs need not repeat it (defaults to "
+            "$AUTIOBOOK_SERIES)",
+        )
 
     if group in ["all", "runtime"]:
         g.add_argument(

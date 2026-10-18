@@ -249,17 +249,30 @@ def _audition_voices(
     return None, False
 
 
+def unused_first(available: list[str], used: set[str]) -> list[str]:
+    """preset voices nobody holds yet, then the rest, each in backend order.
+
+    a voice already given to someone in the series stays selectable -- the
+    list is finite -- but is offered only once the fresh ones run out.
+    """
+    return [v for v in available if v not in used] + [v for v in available if v in used]
+
+
 def run_casting(
     workdir: Path,
     cast: list[Character],
     engine: Any,
     force: bool = False,
+    fixed: dict[str, str] | None = None,
+    used: set[str] | None = None,
 ) -> dict[str, str]:
     """interactively assign a preset voice to each character.
 
     plays each voice saying the character's audition line; the user navigates
     the list with yes/next/prev/replay/skip/quit while it plays.
-    resumable: existing mappings are preserved unless force=True.
+    resumable: existing mappings are preserved unless force=True. `fixed`
+    voices (series bindings, designed voices) hold even under force, and
+    voices in `used` or already cast are offered last.
     """
     available = engine.list_voices()
     if not available:
@@ -268,6 +281,7 @@ def run_casting(
     print(f"casting: {len(available)} preset voices available: {', '.join(available)}")
 
     voices = {} if force else load_voices(workdir)
+    voices.update(fixed or {})
     quit_requested = False
 
     for char in cast:
@@ -282,7 +296,10 @@ def run_casting(
         print(f"  voice: {char.voice_prompt()}")
         print(f"  line: {char.audition_text()!r}")
 
-        cast_voice, quit_requested = _audition_voices(workdir, char, available, engine)
+        taken = (used or set()) | set(voices.values())
+        cast_voice, quit_requested = _audition_voices(
+            workdir, char, unused_first(available, taken), engine
+        )
 
         if cast_voice and cast_voice != SKIP_CHAR:
             voices[char.name] = cast_voice

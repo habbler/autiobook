@@ -157,7 +157,8 @@ def cmd_dramatize(args):
 
     step = getattr(args, "step", False)
     emotions = getattr(args, "emotions", False)
-    preset_voices = getattr(args, "preset_voices", False)
+    design_voices = getattr(args, "design_voices", False)
+    preset_voices = getattr(args, "preset_voices", False) or design_voices
     directed = getattr(args, "directed", False)
     accept = getattr(args, "accept", False)
     phases = ["extract", "cast", "audition"]
@@ -225,6 +226,7 @@ def cmd_dramatize(args):
             chapter_wise=chapter_wise,
             audition_lines=getattr(args, "llm_audition_lines", False),
             export_fn=export_fn,
+            design_voices=design_voices,
         )
 
     _run_pipeline(args, process_fn, "dramatize", phases=phases)
@@ -543,6 +545,15 @@ def main():
                     },
                 ),
                 (
+                    ("--design-voices",),
+                    {
+                        "action": "store_true",
+                        "help": "gemini tts only: design a stored custom voice per "
+                        "named character from its voice prompt (implies "
+                        "--preset-voices; walk-ons and extras keep presets)",
+                    },
+                ),
+                (
                     ("--accept",),
                     {
                         "action": "store_true",
@@ -636,6 +647,15 @@ def main():
                         "action": "store_true",
                         "help": "interactive casting loop: audition voices and pick one "
                         "per character (combine with --preset-voices)",
+                    },
+                ),
+                (
+                    ("--design-voices",),
+                    {
+                        "action": "store_true",
+                        "help": "gemini tts only: design a stored custom voice per "
+                        "named character from its voice prompt (implies "
+                        "--preset-voices; walk-ons and extras keep presets)",
                     },
                 ),
                 (
@@ -1002,6 +1022,12 @@ def main():
     set_active_seed(seed)
     where = f"; recorded in {workdir / SEED_FILE}" if workdir else ""
     print(f"seed: {seed} ({origin}){where}")
+    if hasattr(args, "series"):
+        from .series import resolve_series
+
+        series = resolve_series(workdir, args.series)
+        if series is not None:
+            print(f"series: {series}")
     try:
         args.func(args)
     except KeyboardInterrupt:

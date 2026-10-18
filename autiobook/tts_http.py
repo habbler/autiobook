@@ -414,7 +414,11 @@ def _post_stream(
 
 
 def _post_json(
-    url: str, body: dict, api_key: str = "", headers: dict[str, str] | None = None
+    url: str,
+    body: dict,
+    api_key: str = "",
+    headers: dict[str, str] | None = None,
+    retryable: Callable[[Exception], bool] = _retryable,
 ) -> bytes:
     """send json post request, return response bytes."""
     req = _json_request(url, body, api_key, headers=headers)
@@ -424,7 +428,33 @@ def _post_json(
             response_bytes: bytes = resp.read()
             return response_bytes
 
-    return _request(attempt)
+    return _request(attempt, retryable)
+
+
+def _refused(err: Exception) -> bool:
+    """retryable only when the server answered without acting on the request.
+
+    for a post that creates something: a socket dropped after sending may
+    have created it already, and a second send would make a duplicate.
+    """
+    return isinstance(err, urllib.error.HTTPError) and err.code in TTS_RETRY_STATUS
+
+
+def _delete(url: str, headers: dict[str, str] | None = None) -> None:
+    """send a DELETE, discarding the reply body."""
+    req = urllib.request.Request(url, headers=headers or {}, method="DELETE")
+
+    def attempt() -> None:
+        with urllib.request.urlopen(req, timeout=TTS_HTTP_TIMEOUT) as resp:
+            resp.read()
+
+    _request(attempt)
+
+
+def _http_status(err: Exception) -> int | None:
+    """status code behind a failure _request surfaced, if it was an http one."""
+    cause = err.__cause__
+    return cause.code if isinstance(cause, urllib.error.HTTPError) else None
 
 
 def _post_multipart(
@@ -810,6 +840,109 @@ class HTTPTTSEngine:
         _voice_cache[cache_key] = voice_id
         print(f"created server voice: {voice_id} ({resp.get('mode', 'xvec')})")
         return voice_id
+
+    def _require_gemini(self, feature: str) -> None:
+        """reject a gemini-only feature on any other backend."""
+        if self.dialect != TTS_DIALECT_GEMINI:
+            raise RuntimeError(
+                f"{feature} needs gemini tts (--tts-dialect gemini); "
+                f"{self.config.api_base} does not offer it"
+            )
+
+    def _gemini_voices_url(self, voice_id: str = "") -> str:
+        url = f"{self.config.api_base}/voices"
+        return f"{url}/{voice_id}" if voice_id else url
+
+    def create_designed_voice(
+        self,
+        prompt: str,
+        display_name: str,
+        gender: str = "",
+        language_code: str = "",
+    ) -> tuple[str, bytes | None]:
+        """design a stored gemini voice from a description.
+
+        returns (voice_id, sample wav bytes or None). the voice persists in the
+        google project, counts against its quota, and expires a year after its
+        last use. a create is not retried once sent: a dropped reply may still
+        have made the voice, and a second send would spend quota on a twin.
+        """
+        self._require_gemini("voice design")
+        voice: dict[str, Any] = {
+            "model": self.config.model,
+            "type": "prompted",
+            "display_name": display_name,
+            "prompted": {"input": prompt},
+        }
+        if gender:
+            voice["gender"] = gender
+        if language_code:
+            voice["language_code"] = language_code
+        reply = json.loads(
+            _post_json(
+                self._gemini_voices_url(),
+                {"store": True, "voice": voice},
+                retryable=_refused,
+                **self._auth(),
+            )
+        )
+        # the sdk exposes `id`; a resource name ("voices/voice_...") is the
+        # other shape google apis answer with
+        voice_id = reply.get("id") or str(reply.get("name", "")).rsplit("/", 1)[-1]
+        if not voice_id:
+            raise RuntimeError(f"gemini voice design returned no voice id: {reply}")
+        sample = (reply.get("sample_audio") or {}).get("data")
+        return voice_id, base64.b64decode(sample) if sample else None
+
+    def voice_exists(self, voice_id: str) -> bool:
+        """whether google still holds a stored voice (it expires when unused)."""
+        self._require_gemini("stored voices")
+        try:
+            _get_json(self._gemini_voices_url(voice_id), **self._auth())
+        except RuntimeError as e:
+            if _http_status(e) == 404:
+                return False
+            raise
+        return True
+
+    def delete_voice(self, voice_id: str) -> None:
+        """delete a stored voice, freeing its quota slot; gone already is fine."""
+        self._require_gemini("stored voices")
+        try:
+            _delete(self._gemini_voices_url(voice_id), **self._auth())
+        except RuntimeError as e:
+            if _http_status(e) != 404:
+                raise
+
+    def count_stored_voices(self) -> int:
+        """custom voices (designed or replicated) the project holds."""
+        self._require_gemini("stored voices")
+        count = 0
+        token = ""
+        while True:
+            query = [
+                ("type", "prompted"),
+                ("type", "replicated"),
+                ("page_size", "1000"),
+            ]
+            if token:
+                query.append(("page_token", token))
+            url = f"{self._gemini_voices_url()}?{urllib.parse.urlencode(query)}"
+            reply = _get_json(url, **self._auth())
+            # the type filter already drops prebuilt voices; checking each
+            # entry as well keeps a server that ignores it from inflating this
+            count += sum(
+                1
+                for v in reply.get("voices") or []
+                if isinstance(v, dict)
+                and (
+                    v.get("type") in ("prompted", "replicated")
+                    or str(v.get("id", "")).startswith("voice_")
+                )
+            )
+            token = reply.get("next_page_token") or ""
+            if not token:
+                return count
 
     def clone_voice(
         self,

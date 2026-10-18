@@ -118,12 +118,15 @@ def run_audition(
     preset_voices: bool = False,
     directed: bool = False,
     accept: bool = False,
+    design_voices: bool = False,
 ) -> None:
     """generate the per-character base voice (description only).
 
     modes:
       preset_voices=True, directed=False: auto round-robin assign backend voices
       preset_voices=True, directed=True: interactive casting loop with backend voices
+      design_voices=True (implies preset_voices): gemini designs a stored
+        voice per named character first; directed lets each be redesigned
       accept=True: skip regeneration; mark existing wavs as fresh under current
         cast hashes (useful after tweaking descriptions without wanting to redo
         the audio)
@@ -134,6 +137,17 @@ def run_audition(
 
     voices_dir = get_command_dir(workdir, AUDITION_COMMAND)
     resume = ResumeManager.for_command(workdir, AUDITION_COMMAND, force=force)
+    preset_voices = preset_voices or design_voices
+
+    if not preset_voices and not accept:
+        from .series import load_series_for
+
+        if load_series_for(workdir) is not None:
+            print(
+                "series: the cast is locked to the series, but voices are only "
+                "bound with --preset-voices or --design-voices; designed clips "
+                "from the local server stay per book"
+            )
 
     if not cast:
         cast_path = get_command_dir(workdir, "cast") / CAST_FILE
@@ -156,7 +170,15 @@ def run_audition(
             return
 
     if preset_voices:
-        _run_preset(workdir, cast, config, voices_dir, force=force, directed=directed)
+        _run_preset(
+            workdir,
+            cast,
+            config,
+            voices_dir,
+            force=force,
+            directed=directed,
+            design=design_voices,
+        )
         return
 
     if config is None:
@@ -831,9 +853,18 @@ def _run_preset(
     voices_dir: Path,
     force: bool = False,
     directed: bool = False,
+    design: bool = False,
 ) -> None:
-    """assign preset backend voices to characters and render audition wavs."""
+    """assign backend voices to characters and render audition wavs.
+
+    voices are decided in order: the book's series, then gemini voice design
+    (when `design`), then the preset list for everyone left. the first two
+    are fixed: --force re-renders their takes but never trades them away,
+    since a dropped designed voice would hold its quota slot for a year.
+    """
+    from .binding import bind_series_voices, design_voices
     from .casting import load_voices, run_casting, save_voices
+    from .series import VoiceBinding, book_label, load_series_for, record_book
     from .tts_http import HTTPTTSConfig, HTTPTTSEngine
 
     if not isinstance(config, HTTPTTSConfig):
@@ -842,12 +873,73 @@ def _run_preset(
         )
 
     engine = HTTPTTSEngine(config)
+    series = load_series_for(workdir)
+    on_disk = load_voices(workdir)
+    by_name = {c.name: c for c in cast}
 
-    if directed:
-        assignments = run_casting(workdir, cast, engine, force=force)
-    else:
-        assignments = _assign_round_robin(engine, cast, workdir, force=force)
+    def keep(name: str, binding: VoiceBinding) -> None:
+        """record a newly created voice at once: one lost to a crash later in
+        the run would hold a quota slot unused, and be designed again."""
+        current = load_voices(workdir)
+        current[name] = binding.voice_id
+        save_voices(workdir, current)
+        if series is not None:
+            record_book(
+                series,
+                [by_name[name]],
+                {name: binding.voice_id},
+                {name: binding},
+                book_label(workdir),
+            )
+            series.save()
+
+    # designed voices already held stay fixed under --force (see docstring)
+    fixed = {n: v for n, v in on_disk.items() if v.startswith("voice_")}
+    new_bindings: dict[str, VoiceBinding] = {}
+    if series is not None:
+        bound, new_bindings = bind_series_voices(workdir, cast, engine, series)
+        for name, binding in new_bindings.items():
+            keep(name, binding)
+        for name, series_voice in bound.items():
+            if on_disk.get(name) not in (None, series_voice):
+                print(
+                    f"series: {name} recast from '{on_disk[name]}' to their "
+                    f"series voice '{series_voice}'"
+                )
+        fixed.update(bound)
+
+    quit_requested = False
+    if design:
+        decided = {**({} if force else on_disk), **fixed}
+        designed, quit_requested = design_voices(
+            workdir, cast, engine, series, decided, directed=directed, on_design=keep
+        )
+        new_bindings.update(designed)
+        fixed.update({n: b.voice_id for n, b in designed.items()})
+
+    used = series.used_voices() if series is not None else set()
+    if quit_requested:
+        assignments = {**({} if force else on_disk), **fixed}
         save_voices(workdir, assignments)
+    elif directed:
+        assignments = run_casting(
+            workdir, cast, engine, force=force, fixed=fixed, used=used
+        )
+    else:
+        assignments = _assign_round_robin(
+            engine, cast, workdir, force=force, fixed=fixed, used=used
+        )
+        save_voices(workdir, assignments)
+
+    if series is not None:
+        added = record_book(
+            series, cast, assignments, new_bindings, book_label(workdir)
+        )
+        series.save()
+        print(
+            f"series: {series.path} holds {len(series.entries)} character(s)"
+            + (f", {added} new from this book" if added else "")
+        )
 
     if not assignments:
         print("audition: no voices assigned")
@@ -901,12 +993,20 @@ def _run_preset(
 
 
 def _assign_round_robin(
-    engine: Any, cast: List[Character], workdir: Path, force: bool = False
+    engine: Any,
+    cast: List[Character],
+    workdir: Path,
+    force: bool = False,
+    fixed: dict[str, str] | None = None,
+    used: set[str] | None = None,
 ) -> dict[str, str]:
     """deterministically assign backend voices to characters.
 
     narrator gets the first voice, others cycle through the rest in cast order.
-    existing voices.json entries are preserved unless force=True.
+    existing voices.json entries are preserved unless force=True; `fixed`
+    entries always are. a series run passes the voices it has given out as
+    `used`: new characters then take voices nobody holds while any are left,
+    so a newcomer in book three does not inherit the hero's voice.
     """
     from .casting import load_voices
 
@@ -915,19 +1015,30 @@ def _assign_round_robin(
         raise RuntimeError("no preset voices returned from backend")
 
     existing = {} if force else load_voices(workdir)
-    assigned: dict[str, str] = dict(existing)
+    assigned: dict[str, str] = {**existing, **(fixed or {})}
 
-    # narrator takes first voice
-    narrator = next((c for c in cast if c.name == "Narrator"), None)
-    others = [c for c in cast if c.name != "Narrator"]
-    rest_voices = [v for v in available if v != available[0]] or available
+    if not used:
+        # narrator takes first voice
+        narrator = next((c for c in cast if c.name == "Narrator"), None)
+        others = [c for c in cast if c.name != "Narrator"]
+        rest_voices = [v for v in available if v != available[0]] or available
 
-    if narrator and narrator.name not in assigned:
-        assigned[narrator.name] = available[0]
-    for i, char in enumerate(others):
-        if char.name in assigned:
-            continue
-        assigned[char.name] = rest_voices[i % len(rest_voices)]
+        if narrator and narrator.name not in assigned:
+            assigned[narrator.name] = available[0]
+        for i, char in enumerate(others):
+            if char.name in assigned:
+                continue
+            assigned[char.name] = rest_voices[i % len(rest_voices)]
+    else:
+        taken = set(used) | set(assigned.values())
+        for char in cast:
+            if char.name in assigned:
+                continue
+            fresh = [v for v in available if v not in taken]
+            # once every voice is held, cycle through the list again
+            voice = fresh[0] if fresh else available[len(assigned) % len(available)]
+            assigned[char.name] = voice
+            taken.add(voice)
 
     print(f"audition: round-robin assigned {len(assigned)} voices")
     return assigned
@@ -937,7 +1048,8 @@ def cmd_audition(args):
     from .utils import get_design_config
 
     config = get_design_config(args)
-    preset_voices = getattr(args, "preset_voices", False)
+    design_voices = getattr(args, "design_voices", False)
+    preset_voices = getattr(args, "preset_voices", False) or design_voices
     directed = getattr(args, "directed", False)
     if preset_voices:
         # preset mode needs an http backend and the custom-voice tts model
@@ -961,4 +1073,5 @@ def cmd_audition(args):
         preset_voices=preset_voices,
         directed=directed,
         accept=getattr(args, "accept", False),
+        design_voices=design_voices,
     )
